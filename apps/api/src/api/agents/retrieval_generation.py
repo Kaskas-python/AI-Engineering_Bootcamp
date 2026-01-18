@@ -119,9 +119,7 @@ def generate_answer(prompt:str):
 @traceable(
         name="RAG_pipeline"
 )
-def rag_pipeline(question, top_k=5):
-
-    qdrant_client = QdrantClient(url="http://qdrant:6333")
+def rag_pipeline(question:str, qdrant_client: QdrantClient, top_k=5):
 
     retrieved_context = retrieve_data(question, qdrant_client, top_k)
     preprocessed_context = process_context(retrieved_context)
@@ -130,8 +128,8 @@ def rag_pipeline(question, top_k=5):
 
     return {
         "answer": answer,
-        "query": question,
-        "retreived_context_ids": retrieved_context['retrieved_context_ids'],
+        "question": question,
+        "retrieved_context_ids": retrieved_context['retrieved_context_ids'],
         "retrieved_context": retrieved_context['retrieved_context'],
         "similarity_scores": retrieved_context['similarity_scores']
     }

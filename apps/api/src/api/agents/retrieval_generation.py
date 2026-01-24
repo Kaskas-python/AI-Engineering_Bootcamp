@@ -46,8 +46,23 @@ def retrieve_data(query: str, qdrant_client: QdrantClient , k:int =5):
     query_embedding= get_embedding(query)
 
     results = qdrant_client.query_points(
-        collection_name="Amazon-items-collection-00",
-        query=query_embedding,
+        collection_name="Amazon-items-collection-01-hybrid-search",
+        prefetch=[
+            Prefetch(
+                query=query_embedding,
+                using="text-embedding-3-small",
+                limit=20
+            ),
+            Prefetch(
+                query=Document(
+                    text=query,
+                    model="qdrant/bm25"
+                ),
+                using="bm25",
+                limit=20
+            )
+        ],
+        query=FusionQuery(fusion="rrf"),
         limit=k
     )
 
@@ -180,9 +195,10 @@ def rag_pipeline_wrapper(question, top_k=5):
 
     for item in result.get("references", []):
         payload = qdrant_client.query_points(
-            collection_name="Amazon-items-collection-00",
+            collection_name="Amazon-items-collection-01-hybrid-search",
             query=dummy_vector,
             limit=1,
+            using="text-embedding-3-small",
             with_payload=True,
             query_filter=Filter(
                 must=[

@@ -3,6 +3,7 @@ from typing import  Optional
 
 class RAGRequest(BaseModel):
     query: str = Field(..., description="The query to be used in the RAG pipeline")
+    rerank: bool = Field(False, description="Enable reranking")
 
 class RAGUsedContext(BaseModel):
     image_url: str = Field(..., description="URL of item image")

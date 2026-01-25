@@ -3,11 +3,14 @@ from pydantic import BaseModel, Field
 
 import numpy as np
 import openai
+from cohere import ClientV2
 import instructor
 from instructor import Instructor
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue, Prefetch, FusionQuery, Document
 from langsmith import traceable, get_current_run_tree
+
+from api.agents.utils.prompt_management import prompt_template_config
 
 class RAGUsedContext(BaseModel):
     id: str = Field(..., description="Id of item used to answer the question")
@@ -41,9 +44,11 @@ def get_embedding(text, model="text-embedding-3-small"):
         name="retrieve_data",
         run_type="retriever"
 )
-def retrieve_data(query: str, qdrant_client: QdrantClient , k:int =5):
+def retrieve_data(query: str, qdrant_client: QdrantClient , cohere_client:ClientV2 = None,  k:int =5):
 
     query_embedding= get_embedding(query)
+
+    fetch_limit = 20 if cohere_client else k
 
     results = qdrant_client.query_points(
         collection_name="Amazon-items-collection-01-hybrid-search",
@@ -63,7 +68,7 @@ def retrieve_data(query: str, qdrant_client: QdrantClient , k:int =5):
             )
         ],
         query=FusionQuery(fusion="rrf"),
-        limit=k
+        limit=fetch_limit
     )
 
     retrieved_context_ids = []
@@ -76,6 +81,19 @@ def retrieve_data(query: str, qdrant_client: QdrantClient , k:int =5):
         retrieved_context.append(result.payload["description"])
         retrieved_context_ratings.append(result.payload["average_rating"])
         similarity_scores.append(result.score)
+
+    if cohere_client:
+        rerank_response = cohere_client.rerank(
+            model="rerank-v4.0-fast",
+            query=query,
+            documents=retrieved_context,
+            top_n=k
+        )
+        indices = [r.index for r in rerank_response.results]
+        retrieved_context_ids = [retrieved_context_ids[i] for i in indices]
+        retrieved_context = [retrieved_context[i] for i in indices]
+        retrieved_context_ratings = [retrieved_context_ratings[i] for i in indices]
+        similarity_scores = [r.relevance_score for r in rerank_response.results]
 
     return {
         "retrieved_context_ids": retrieved_context_ids,
@@ -103,29 +121,15 @@ def process_context(context):
 )
 def build_prompt(preprocessed_context: str, question: str) -> str:
 
-    prompt = f"""
-    You are a shopping assistant that can answer questions about the products in stock.
+    template = prompt_template_config(
+        yaml_file="api/agents/prompts/retrieval_generation_prompts.yaml",
+        prompt_key="retrieval_generation"
+    )
 
-    You will be given a question and a list of context.
-
-    Instructtions:
-    - You need to answer the question based on the provided context only.
-    - Never use word context and refer to it as the available products.
-    - As an output you need to provide:
-
-    * The answer to the question based on the provided context.
-    * The list of the IDs of the chunks that were used to answer the question. Only return the ones that are used in the answer.
-    * Short description (1-2 sentences) of the item based on the description provided in the context.
-
-    - The short description should have the name of the item.
-    - The answer to the question should contain detailed information about the product and returned with detailed specification in bullet points.
-
-    Context:
-    {preprocessed_context}
-
-    Question:
-    {question}
-    """
+    prompt = template.render(
+        preprocessed_context=preprocessed_context,
+        question=question
+        )
 
     return prompt
 
@@ -162,10 +166,11 @@ def rag_pipeline(
     question:str, 
     qdrant_client: QdrantClient, 
     instructor_client: Instructor, 
-    top_k=5
+    cohere_client:ClientV2 = None,
+    top_k:int =5
     )-> dict[str, Any]:
 
-    retrieved_context = retrieve_data(question, qdrant_client, top_k)
+    retrieved_context = retrieve_data(question, qdrant_client, cohere_client, top_k)
     preprocessed_context = process_context(retrieved_context)
     prompt = build_prompt(preprocessed_context, question)
     answer = generate_answer(prompt, instructor_client)
@@ -179,15 +184,18 @@ def rag_pipeline(
         "similarity_scores": retrieved_context['similarity_scores']
     }
 
-def rag_pipeline_wrapper(question, top_k=5):
+def rag_pipeline_wrapper(question: str, top_k: int=5, rerank:bool = False):
 
     qdrant_client = QdrantClient(url="http://qdrant:6333")
     instructor_client = instructor.from_openai(openai.OpenAI())
+
+    cohere_client = ClientV2() if rerank else None
 
     result= rag_pipeline(
         question=question,
         qdrant_client=qdrant_client,
         instructor_client=instructor_client,
+        cohere_client=cohere_client,
         top_k=top_k
     )
     used_context = []

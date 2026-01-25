@@ -22,7 +22,8 @@ def chat(
 ) -> RAGResponse:
 
     answer = rag_pipeline_wrapper(
-        question= payload.query
+        question=payload.query,
+        rerank=payload.rerank
     )
 
     return RAGResponse(

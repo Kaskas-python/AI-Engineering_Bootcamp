@@ -51,6 +51,7 @@ if "used_context" not in st.session_state:
     st.session_state.used_context = []
 
 with st.sidebar:
+    rerank = st.checkbox("Enable reranking", value=False)
 
     suggestions_tab, = st.tabs(["! SUGGESTIONS !"])
 
@@ -71,7 +72,7 @@ if prompt := st.chat_input("Hello! How can I asssist you today?"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        status, output = api_call("post", f"{config.API_URL}/rag", json={"query": prompt})
+        status, output = api_call("post", f"{config.API_URL}/rag", json={"query": prompt, "rerank": rerank})
 
         answer= output['answer']
         used_context = output['used_context']

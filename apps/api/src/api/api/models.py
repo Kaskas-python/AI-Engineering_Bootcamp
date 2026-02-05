@@ -3,6 +3,7 @@ from typing import  Optional
 
 class RAGRequest(BaseModel):
     query: str = Field(..., description="The query to be used in the RAG pipeline")
+    thread_id: str = Field(..., description="Thread ID of conversation")
     rerank: bool = Field(False, description="Enable reranking")
 
 class RAGUsedContext(BaseModel):

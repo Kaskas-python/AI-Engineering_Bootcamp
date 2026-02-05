@@ -23,6 +23,7 @@ def chat(
 
     answer = rag_agent_wrapper(
         question=payload.query,
+        thread_id=payload.thread_id,
         rerank=payload.rerank
     )
 

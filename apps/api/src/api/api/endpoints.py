@@ -17,11 +17,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-rag_router = APIRouter()
+agent_router = APIRouter()
 feedback_router = APIRouter()
 
 
-@rag_router.post("/")
+@agent_router.post("/")
 def chat(
     request: Request,
     payload: RAGRequest
@@ -51,5 +51,5 @@ def send_feedback(
 
 api_router = APIRouter()
 
-api_router.include_router(rag_router, prefix="/rag", tags=["rag"])
+api_router.include_router(agent_router, prefix="/agent", tags=["agents"])
 api_router.include_router(feedback_router, prefix="/submit_feedback", tags=["feedback"])

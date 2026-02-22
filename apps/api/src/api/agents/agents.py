@@ -47,6 +47,13 @@ class ShoppingCartAgentResponse(BaseModel):
     final_answer: bool = False
     tool_calls: List[ToolCall] = []
 
+### Warehouse Manager Agent Response schemas
+
+class WarehouseManagerAgentResponse(BaseModel):
+    answer: str = Field(description="Answer to the question.")
+    final_answer: bool = False
+    tool_calls: List[ToolCall] = []
+
 
 ### Q&A Agent Node
 
@@ -143,6 +150,55 @@ def shopping_cart_agent_node(state) -> dict:
             "iteration": state.shopping_cart_agent.iteration + 1,
             "final_answer": response.final_answer,
             "available_tools": state.shopping_cart_agent.available_tools
+        },
+        "answer": response.answer
+    }
+
+### Warehouse Agent Node
+
+@traceable(
+    name="warehouse_manager_agent_node",
+    run_type="llm",
+    metadata={"ls_provider": "openai", "ls_model_name": "gpt-4.1"}
+)
+def warehouse_manager_agent_node(state) -> dict:
+
+    template = prompt_template_config(
+        yaml_file="api/agents/prompts/warehouse_manager_agent.yaml",
+        prompt_key="warehouse_manager_agent"
+    )
+
+    prompt = template.render(
+        available_tools=state.warehouse_manager_agent.available_tools
+    )
+
+    messages = state.messages
+
+    conversation = []
+
+    for message in messages:
+        conversation.append(convert_to_openai_messages(message))
+
+    client = instructor.from_openai(OpenAI())
+
+    response, raw_response = client.chat.completions.create_with_completion(
+        model="gpt-4.1",
+        response_model=WarehouseManagerAgentResponse,
+        messages=[{"role": "system", "content": prompt}, *conversation],
+        temperature=0,
+    )
+
+    current_run = track_current_run(raw_response)
+
+    ai_message = format_ai_message(response)
+
+    return {
+        "messages": [ai_message],
+        "warehouse_manager_agent": {
+            "tool_calls": [tool_call.model_dump() for tool_call in response.tool_calls],
+            "iteration": state.warehouse_manager_agent.iteration + 1,
+            "final_answer": response.final_answer,
+            "available_tools": state.warehouse_manager_agent.available_tools
         },
         "answer": response.answer
     }

@@ -209,4 +209,5 @@ __marimo__/
 data/
 qdrant_storage/
 postgres_data/
+CLAUDE.md
 

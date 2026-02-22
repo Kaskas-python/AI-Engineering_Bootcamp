@@ -1,5 +1,5 @@
 from typing import Dict, Any, Annotated, List, Callable
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from operator import add
 import json
 
@@ -14,66 +14,156 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from langchain_core.messages import ToolMessage
 
 from api.agents.agents import(
-    ToolCall, RAGUsedContext, agent_node, intent_router_node
+    ToolCall, RAGUsedContext, Delegation, 
+    product_qa_agent_node, shopping_cart_agent_node, warehouse_manager_agent_node, coordinator_agent_node
 )
 from api.agents.utils.utils import get_tool_descriptions
-from api.agents.tools import get_formatted_items_context, get_formatted_reviews_context
+from api.agents.tools import (
+    get_formatted_items_context, get_formatted_reviews_context,
+    add_to_shopping_cart, remove_from_cart, get_shopping_cart,
+    check_warehouse_availability, reserve_warehouse_items
+)
 
 class Tools(BaseModel):
     tools: list = []
     descriptions: list | str
 
-class State(BaseModel):
-    messages: Annotated[List[Any], add] = []
-    question_relevant: bool = False
+class AgentProperties(BaseModel):
     iteration: int = 0
-    answer: str = ""
+    final_answer: bool = False
     available_tools: List[Dict[str, Any]] = []
     tool_calls: List[ToolCall] = []
+
+class CoordinatorAgentProperties(BaseModel):
+    iteration: int = 0
     final_answer: bool = False
+    plan: List[Delegation] = []
+    next_agent: str = ""
+
+class State(BaseModel):
+    messages: Annotated[List[Any], add] = []
+    product_qa_agent: AgentProperties = Field(default_factory=AgentProperties)
+    shopping_cart_agent: AgentProperties = Field(default_factory=AgentProperties)
+    warehouse_manager_agent: AgentProperties = Field(default_factory=AgentProperties)
+    coordinator_agent: CoordinatorAgentProperties = Field(default_factory=CoordinatorAgentProperties)
+    answer: str = ""
     references: Annotated[List[RAGUsedContext], add] = []
-    rerank: bool = False
+    user_id: str = ""
+    cart_id: str = ""
     trace_id: str = ""
+    rerank: bool = False
 
 ### Edges
-def tool_router(state: State) -> str:
-    
-    """Decide whether to continue or end"""
 
-    if state.final_answer == True:
+def product_qa_agent_tool_router(state: State) -> str:
+    """Decide whether to continue or end"""
+    
+    if state.product_qa_agent.final_answer:
         return "end"
-    elif state.iteration > 2:
+    elif state.product_qa_agent.iteration > 4:
         return "end"
-    elif len(state.tool_calls) > 0:
+    elif len(state.product_qa_agent.tool_calls) > 0:
         return "tools"
     else:
         return "end"
     
-
-def intent_router_conditional_edges(state: State):
-
-    if state.question_relevant:
-        return "agent_node"
+def shopping_cart_agent_tool_router(state: State) -> str:
+    """Decide whether to continue or end"""
+    
+    if state.shopping_cart_agent.final_answer:
+        return "end"
+    elif state.shopping_cart_agent.iteration > 2:
+        return "end"
+    elif len(state.shopping_cart_agent.tool_calls) > 0:
+        return "tools"
     else:
         return "end"
     
-### Tool Node with state injection
+def warehouse_manager_agent_tool_router(state: State) -> str:
+    """Decide whether to continue or end"""
+    
+    if state.warehouse_manager_agent.final_answer:
+        return "end"
+    elif state.warehouse_manager_agent.iteration > 2:
+        return "end"
+    elif len(state.warehouse_manager_agent.tool_calls) > 0:
+        return "tools"
+    else:
+        return "end"
 
-def tool_node(state: State) -> dict:
+def coordinator_agent_edge(state: State):
+
+    if state.coordinator_agent.iteration > 4:
+        return "end"
+    elif state.coordinator_agent.final_answer and len(state.coordinator_agent.plan) == 0:
+        return "end"
+    elif state.coordinator_agent.next_agent == "product_qa_agent":
+        return "product_qa_agent"
+    elif state.coordinator_agent.next_agent == "shopping_cart_agent":
+        return "shopping_cart_agent"
+    elif state.coordinator_agent.next_agent == "warehouse_manager_agent":
+        return "warehouse_manager_agent"
+    else:
+        return "end"
+    
+### Tool Nodes with state injection
+
+def product_qa_tool_node(state: State) -> dict:
     tools_map = {
-        "get_formatted_items_context": get_formatted_items_context, 
+        "get_formatted_items_context": get_formatted_items_context,
         "get_formatted_reviews_context": get_formatted_reviews_context
-        }
+    }
     messages = []
 
-    for i, tc in enumerate(state.tool_calls):
+    for i, tc in enumerate(state.product_qa_agent.tool_calls):
         tool_fn = tools_map.get(tc.name)
         if tool_fn:
             args = {**tc.arguments, "rerank": state.rerank}
             result = tool_fn(**args)
-            messages.append(ToolMessage(content=result, tool_call_id=f"call_{i}"))
+            messages.append(ToolMessage(content=str(result), tool_call_id=f"call_{i}"))
 
-    return {"messages": messages, "tool_calls": []}
+    return {
+        "messages": messages,
+        "product_qa_agent": {**state.product_qa_agent.model_dump(), "tool_calls": []}
+    }
+
+
+def shopping_cart_agent_tool_node(state: State) -> dict:
+    tools_map = {
+        "add_to_shopping_cart": add_to_shopping_cart,
+        "remove_from_cart": remove_from_cart,
+        "get_shopping_cart": get_shopping_cart
+    }
+    messages = []
+
+    for i, tc in enumerate(state.shopping_cart_agent.tool_calls):
+        tool_fn = tools_map.get(tc.name)
+        if tool_fn:
+            result = tool_fn(**tc.arguments)
+            messages.append(ToolMessage(content=str(result), tool_call_id=f"call_{i}"))
+
+    return {
+        "messages": messages,
+        "shopping_cart_agent": {**state.shopping_cart_agent.model_dump(), "tool_calls": []}
+    }
+
+def warehouse_manager_agent_tool_node(state: State) -> dict:
+    tools_map = {
+        "check_warehouse_availability":check_warehouse_availability,
+        "reserve_warehouse_items":reserve_warehouse_items
+    }
+    messages = []
+
+    for i, tc in enumerate(state.warehouse_manager_agent.tool_calls):
+        tool_fn = tools_map.get(tc.name)
+        if tool_fn:
+            result = tool_fn(**tc.arguments)
+            messages.append(ToolMessage(content=str(result), tool_call_id=f"call_{i}"))
+
+    return {
+        "messages": messages,
+        "warehouse_manager_agent": {**state.warehouse_manager_agent.model_dump(), "tool_calls": []}
+    }
 
 ### Workflow
 
@@ -90,76 +180,111 @@ def build_workflow(state_schema:type[BaseModel]) -> StateGraph:
 
     workflow = StateGraph(state_schema)
 
-    workflow.add_node("agent_node", agent_node)
-    workflow.add_node("tool_node", tool_node)
-    workflow.add_node("intent_router_node", intent_router_node)
+    workflow.add_node("product_qa_agent", product_qa_agent_node)
+    workflow.add_node("product_qa_tool_node", product_qa_tool_node)
+
+    workflow.add_node("shopping_cart_agent", shopping_cart_agent_node)
+    workflow.add_node("shopping_cart_agent_tool_node", shopping_cart_agent_tool_node)
+
+    workflow.add_node("warehouse_manager_agent", warehouse_manager_agent_node)
+    workflow.add_node("warehouse_manager_agent_tool_node", warehouse_manager_agent_tool_node)
 
 
-    workflow.add_edge(START, "intent_router_node")
+    workflow.add_node("coordinator_agent_node", coordinator_agent_node)
+
+
+    workflow.add_edge(START, "coordinator_agent_node")
     workflow.add_conditional_edges(
-        "intent_router_node",
-        intent_router_conditional_edges,
+        "coordinator_agent_node",
+        coordinator_agent_edge,
         {
-            "agent_node": "agent_node",
+            "product_qa_agent": "product_qa_agent",
+            "shopping_cart_agent": "shopping_cart_agent",
+            "warehouse_manager_agent": "warehouse_manager_agent",
             "end": END
         }
-        
     )
     workflow.add_conditional_edges(
-        "agent_node",
-        tool_router,
+        "product_qa_agent",
+        product_qa_agent_tool_router,
         {
-            "tools": "tool_node",
-            "end": END
-
+            "tools": "product_qa_tool_node",
+            "end": "coordinator_agent_node"
         }
     )
-    workflow.add_edge("tool_node", "agent_node")
+
+    workflow.add_conditional_edges(
+        "shopping_cart_agent",
+        shopping_cart_agent_tool_router,
+        {
+            "tools": "shopping_cart_agent_tool_node",
+            "end": "coordinator_agent_node"
+        }
+    )
+    workflow.add_conditional_edges(
+        "warehouse_manager_agent",
+        warehouse_manager_agent_tool_router,
+        {
+            "tools": "warehouse_manager_agent_tool_node",
+            "end": "coordinator_agent_node"
+        }
+    )
+
+    workflow.add_edge("product_qa_tool_node", "product_qa_agent")
+    workflow.add_edge("shopping_cart_agent_tool_node", "shopping_cart_agent")
+    workflow.add_edge("warehouse_manager_agent_tool_node", "warehouse_manager_agent")
 
     return workflow
 
 
-def run_agent(question:str, thread_id:str, rerank:bool) -> str:
 
-    tools = build_tools(
-        get_formatted_context=get_formatted_items_context, 
+def run_agent_stream(question:str, thread_id:str, rerank:bool):
+
+
+    product_qa_agent_tools = build_tools(
+        get_formatted_items_context=get_formatted_items_context,
         get_formatted_reviews_context=get_formatted_reviews_context
     )
-
-    state = {
-        "messages": [{"role":"user", "content": question}],
-        "iteration": 0,
-        "available_tools": tools.descriptions,
-        "rerank": rerank
-    }
-    config ={
-        "configurable": {
-            "thread_id": thread_id
-        }
-    }
-    with PostgresSaver.from_conn_string("postgresql://langgraph_user:langgraph_password@postgres:5432/langgraph_db") as checkpointer:
-
-        workflow = build_workflow(State)
-        graph = workflow.compile(checkpointer=checkpointer)
-
-        result= graph.invoke(state, config)
-
-    return result
-
-
-def run_agent_stream(question:str, thread_id:str, rerank:bool) -> str:
-
-    tools = build_tools(
-        get_formatted_context=get_formatted_items_context, 
-        get_formatted_reviews_context=get_formatted_reviews_context
+    shopping_cart_agent_tools = build_tools(
+        add_to_shopping_cart=add_to_shopping_cart,
+        remove_from_cart=remove_from_cart,
+        get_shopping_cart=get_shopping_cart
     )
-
-    state = {
-        "messages": [{"role":"user", "content": question}],
-        "iteration": 0,
-        "available_tools": tools.descriptions,
+    warehouse_manager_agent_tools = build_tools(
+        check_warehouse_availability=check_warehouse_availability,
+        reserve_warehouse_items= reserve_warehouse_items
+    )
+    state= {
+        "messages": [{"role": "user", "content": question}],
+        "user_id": thread_id,
+        "cart_id": thread_id,
+        "product_qa_agent": {
+            "iteration": 0,
+            "final_answer": False,
+            "available_tools": product_qa_agent_tools.descriptions,
+            "tool_calls": []
+        },
+        "shopping_cart_agent": {
+            "iteration": 0,
+            "final_answer": False,
+            "available_tools": shopping_cart_agent_tools.descriptions,
+            "tool_calls": []
+        },
+        "warehouse_manager_agent": {
+            "iteration": 0,
+            "final_answer": False,
+            "available_tools": warehouse_manager_agent_tools.descriptions,
+            "tool_calls": []
+        },
+        "coordinator_agent":{
+            "iteration": 0,
+            "final_answer": False,
+            "next_agent": "",
+            "plan": []
+        },
         "rerank": rerank
     }
+
     config ={
         "configurable": {
             "thread_id": thread_id
@@ -187,51 +312,6 @@ def run_agent_stream(question:str, thread_id:str, rerank:bool) -> str:
     yield result
 
 
-def rag_agent_wrapper(question:str, thread_id:str, rerank:bool = False):
-
-    qdrant_client = QdrantClient(url="http://qdrant:6333")
-
-    result= run_agent(
-        question=question,
-        thread_id=thread_id,
-        rerank=rerank
-        )
-    
-    used_context = []
-    dummy_vector = np.zeros(1536).tolist()
-
-    for item in result.get("references", []):
-        payload = qdrant_client.query_points(
-            collection_name="Amazon-items-collection-01-hybrid-search",
-            query=dummy_vector,
-            limit=1,
-            using="text-embedding-3-small",
-            with_payload=True,
-            query_filter=Filter(
-                must=[
-                    FieldCondition(
-                        key="parent_asin",
-                        match=MatchValue(value=item.id)
-                    )
-                ]
-            )
-        ).points[0].payload
-        
-        image_url = payload.get("image")
-        price = payload.get("price")
-        if image_url:
-            used_context.append({
-                "image_url": image_url,
-                "price": price,
-                "description": item.description
-            })
-
-    return {
-        "answer": result.get("answer", "No answer provided"),
-        "used_context": used_context,
-        "trace_id": result.get("trace_id", "")
-    }
-
 ### Streaming
 
 def _string_for_sse(message:str) -> str:
@@ -246,23 +326,45 @@ def _process_graph_event(chunk):
         return chunk[0] == "updates"
 
     def _tool_to_text(tool_call):
-        if tool_call.name == "get_formatted_items_context":
-            return f"Looking for items: {tool_call.arguments.get('query', '')}."
-        elif tool_call.name == "get_formatted_reviews_context":
-            return f"Fetching user reviews..."
-        else:
-            return f"Unknown tool: {tool_call.name}"
+        match tool_call.name:
+            case "get_formatted_items_context":
+                return f"Looking for items: {tool_call.arguments.get('query', '')}."
+            case "get_formatted_reviews_context":
+                return "Fetching user reviews..."
+            case "add_to_shopping_cart":
+                return "Adding items to your shopping cart..."
+            case "remove_from_cart":
+                return "Removing items from your cart..."
+            case "get_shopping_cart":
+                return "Fetching items from your cart..."
+            case "check_warehouse_availability":
+                return "Checking available items in warehouses..."
+            case "reserve_warehouse_items":
+                return "Reserving items..."
+            case _:
+                return f"Unknown tool: {tool_call.name}"
 
     if _is_node_start(chunk):
-        if chunk[1].get("payload", {}).get("name") == "intent_router_node":
-            return "Analysing the question..."
-        if chunk[1].get("payload", {}).get("name") == "agent_node":
-            return "Planning..."
-        if chunk[1].get("payload", {}).get("name") == "tool_node":
-            message = " ".join([_tool_to_text(tool_call) for tool_call in chunk[1].get('payload', {}).get('input', {}).tool_calls])
-            return message
-    else:
-        return False
+        node_name = chunk[1].get("payload", {}).get("name")
+        input_state = chunk[1].get("payload", {}).get("input")
+
+        match node_name:
+            case "coordinator_agent_node":
+                return "Analysing the question..."
+            case "product_qa_agent":
+                return "Planning..."
+            case "shopping_cart_agent" | "warehouse_manager_agent":
+                return "Performing..."
+            case "product_qa_tool_node":
+                tool_calls = input_state.product_qa_agent.tool_calls
+                return " ".join([_tool_to_text(tc) for tc in tool_calls])
+            case "shopping_cart_agent_tool_node":
+                tool_calls = input_state.shopping_cart_agent.tool_calls
+                return " ".join([_tool_to_text(tc) for tc in tool_calls])
+            case "warehouse_manager_agent_tool_node":
+                tool_calls = input_state.warehouse_manager_agent.tool_calls
+                return " ".join([_tool_to_text(tc) for tc in tool_calls])
+    return False
 
 def rag_agent_stream_wrapper(question:str, thread_id:str, rerank:bool):
 
@@ -280,7 +382,7 @@ def rag_agent_stream_wrapper(question:str, thread_id:str, rerank:bool):
 
     for item in (result or {}).get("references", []):
         payload = qdrant_client.query_points(
-            collection_name="Amazon-items-collection-01-hybrid-search",
+            collection_name="Amazon-items-collection-02-hybrid-search",
             query=dummy_vector,
             limit=1,
             using="text-embedding-3-small",
@@ -303,14 +405,124 @@ def rag_agent_stream_wrapper(question:str, thread_id:str, rerank:bool):
                 "price": price,
                 "description": item.description
             })
+
+    shopping_cart = get_shopping_cart(thread_id, thread_id)
+    shopping_cart_items = [
+        {
+            "price": float(item.get("price")) if item.get("price") else None,
+            "quantity": item.get("quantity"),
+            "currency": item.get("currency"),
+            "product_image_url": item.get("product_image_url"),
+            "total_price": float(item.get("total_price")) if item.get("total_price") else None
+        }
+        for item in shopping_cart
+    ]
+
     yield _string_for_sse(json.dumps(
         {
             "type": "final_answer",
             "data": {
                 "answer": result.get("answer", "No answer provided"),
                 "used_context": used_context,
-                "trace_id": result.get("trace_id", "") 
+                "trace_id": result.get("trace_id", ""),
+                "shopping_cart": shopping_cart_items
             }
 
         }
     ))
+
+# def run_agent(question:str, thread_id:str, rerank:bool) -> str:
+
+#     product_qa_agent_tools = build_tools(
+#         get_formatted_items_context=get_formatted_items_context,
+#         get_formatted_reviews_context=get_formatted_reviews_context
+#     )
+#     shopping_cart_agent_tools = build_tools(
+#         add_to_shopping_cart=add_to_shopping_cart,
+#         remove_from_cart=remove_from_cart,
+#         get_shopping_cart=get_shopping_cart
+#     )
+#     state= {
+#         "messages": [{"role": "user", "content": question}],
+#         "user_id": "abc2",
+#         "cart_id": "2ABC",
+#         "product_qa_agent": {
+#             "iteration": 0,
+#             "final_answer": False,
+#             "available_tools": product_qa_agent_tools.descriptions,
+#             "tool_calls": []
+#         },
+#         "shopping_cart_agent": {
+#             "iteration": 0,
+#             "final_answer": False,
+#             "available_tools": shopping_cart_agent_tools.descriptions,
+#             "tool_calls": []
+#         },
+#         "coordinator_agent":{
+#             "iteration": 0,
+#             "final_answer": False,
+#             "next_agent": "",
+#             "plan": []
+#         },
+#         "rerank": rerank
+#     }
+
+#     config ={
+#         "configurable": {
+#             "thread_id": thread_id
+#         }
+#     }
+#     with PostgresSaver.from_conn_string("postgresql://langgraph_user:langgraph_password@postgres:5432/langgraph_db") as checkpointer:
+
+#         workflow = build_workflow(State)
+#         graph = workflow.compile(checkpointer=checkpointer)
+
+#         result= graph.invoke(state, config)
+
+#     return result
+
+    
+# def rag_agent_wrapper(question:str, thread_id:str, rerank:bool = False):
+
+#     qdrant_client = QdrantClient(url="http://qdrant:6333")
+
+#     result= run_agent(
+#         question=question,
+#         thread_id=thread_id,
+#         rerank=rerank
+#         )
+    
+#     used_context = []
+#     dummy_vector = np.zeros(1536).tolist()
+
+#     for item in result.get("references", []):
+#         payload = qdrant_client.query_points(
+#             collection_name="Amazon-items-collection-02-hybrid-search",
+#             query=dummy_vector,
+#             limit=1,
+#             using="text-embedding-3-small",
+#             with_payload=True,
+#             query_filter=Filter(
+#                 must=[
+#                     FieldCondition(
+#                         key="parent_asin",
+#                         match=MatchValue(value=item.id)
+#                     )
+#                 ]
+#             )
+#         ).points[0].payload
+        
+#         image_url = payload.get("image")
+#         price = payload.get("price")
+#         if image_url:
+#             used_context.append({
+#                 "image_url": image_url,
+#                 "price": price,
+#                 "description": item.description
+#             })
+
+#     return {
+#         "answer": result.get("answer", "No answer provided"),
+#         "used_context": used_context,
+#         "trace_id": result.get("trace_id", "")
+#     }

@@ -1,70 +1,49 @@
-from typing import List, TypedDict
-from pydantic import BaseModel
-
 import openai
-from cohere import ClientV2
+from langsmith import traceable, get_current_run_tree
 from qdrant_client import QdrantClient
 from qdrant_client.models import Prefetch, FusionQuery, Document, Filter, FieldCondition, MatchAny
-from langsmith import traceable, get_current_run_tree
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import numpy as np
 from qdrant_client.models import MatchValue
 
-class WarehouseItemRequest(TypedDict):
-    product_id: str
-    quantity: int
 
-class WarehouseItemReservation(TypedDict):
-    warehouse_id: str
-    product_id: str
-    quantity: int
-
-class RetrievalOutput(BaseModel):
-    context_id: str | None = None
-    context: str | None = None
-    rating: float | None = None
-    similarity_score: float | None = None
 
 @traceable(
-        name="embed_query",
-        run_type="embedding",
-        metadata={"ls_provider": "openai", "ls_model_name": "text-embedding-3-small"}
+    name="embed_query",
+    run_type="embedding",
+    metadata={"ls_provider": "openai", "ls_model_name": "text-embedding-3-small"}
 )
 def get_embedding(text, model="text-embedding-3-small"):
     response = openai.embeddings.create(
         input=text,
         model=model,
     )
-    
+
     current_run = get_current_run_tree()
 
     if current_run:
         current_run.metadata["usage_metadata"] = {
             "input_tokens": response.usage.prompt_tokens,
-            "total_tokens": response.usage.total_tokens
+            "total_tokens": response.usage.total_tokens,
         }
+
     return response.data[0].embedding
 
-### ITEM Description retrieval tool
+
+### Item Description Retrieval Tool
+
 
 @traceable(
-        name="retrieve_data",
-        run_type="retriever"
+    name="retrieve_data",
+    run_type="retriever"
 )
-def retrieve_items_data(
-    query: str, 
-    k:int = 5,
-    rerank:bool = False
-    ):
+def retrieve_items_data(query, k=5):
 
-    qdrant_client = QdrantClient(url="http://qdrant:6333")
-    cohere_client = ClientV2() if rerank else None
+    query_embedding = get_embedding(query)
 
-    query_embedding= get_embedding(query)
-
-    fetch_limit = 20 if cohere_client else k
+    qdrant_client = QdrantClient(url="http://localhost:6333")
 
     results = qdrant_client.query_points(
         collection_name="Amazon-items-collection-02-hybrid-search",
@@ -84,94 +63,72 @@ def retrieve_items_data(
             )
         ],
         query=FusionQuery(fusion="rrf"),
-        limit=fetch_limit
+        limit=k,
     )
 
-    retrieval_outputs = []
+    retrieved_context_ids = []
+    retrieved_context = []
+    similarity_scores = []
+    retrieved_context_ratings = []
 
     for result in results.points:
-        retrieval_output = RetrievalOutput(
-            context_id=result.payload["parent_asin"],
-            context=result.payload["description"],
-            rating=result.payload["average_rating"],
-            similarity_score=result.score
-        )
-        retrieval_outputs.append(retrieval_output)
+        retrieved_context_ids.append(result.payload["parent_asin"])
+        retrieved_context.append(result.payload["description"])
+        retrieved_context_ratings.append(result.payload["average_rating"])
+        similarity_scores.append(result.score)
 
-    if cohere_client:
-        context_list =[c.context for c in retrieval_outputs]
+    return {
+        "retrieved_context_ids": retrieved_context_ids,
+        "retrieved_context": retrieved_context,
+        "retrieved_context_ratings": retrieved_context_ratings,
+        "similarity_scores": similarity_scores,
+    }
 
-        rerank_response = cohere_client.rerank(
-            model="rerank-v4.0-fast",
-            query=query,
-            documents=context_list,
-            top_n=k
-        )
-
-        reranked_outputs =[]
-
-        for r in rerank_response.results:
-            original = retrieval_outputs[r.index]
-            reranked_output = RetrievalOutput(
-                context_id=original.context_id,
-                context=original.context,
-                rating=original.rating,
-                similarity_score=r.relevance_score
-            )
-            reranked_outputs.append(reranked_output)
-
-        return reranked_outputs
-
-    return retrieval_outputs
 
 @traceable(
-        name="format_retrieved_context",
-        run_type="prompt"
+    name="format_retrieved_context",
+    run_type="prompt"
 )
-def process_items_context(context: List[RetrievalOutput]) ->str:
+def process_items_context(context):
 
     formatted_context = ""
 
-    for i in context: 
-        formatted_context += f"- ID: {i.context_id}, rating: {i.rating}, description: {i.context}\n"
+    for id, chunk, rating in zip(context["retrieved_context_ids"], context["retrieved_context"], context["retrieved_context_ratings"]):
+        formatted_context += f"- ID: {id}, rating: {rating}, description: {chunk}\n"
 
     return formatted_context
 
-def get_formatted_items_context(query: str, top_k: int = 5, rerank: bool = False) -> str:
+
+def get_formatted_items_context(query: str, top_k: int = 5) -> str:
 
     """Get the top k context, each representing an inventory item for a given query.
-
+    
     Args:
         query: The query to get the top k context for
         top_k: The number of context chunks to retrieve, works best with 5 or more
-
+    
     Returns:
         A string of the top k context chunks with IDs and average ratings prepending each chunk, each representing an inventory item for a given query.
     """
-    context = retrieve_items_data(query=query, k=top_k, rerank=rerank)
+
+    context = retrieve_items_data(query, top_k)
     formatted_context = process_items_context(context)
 
     return formatted_context
 
-### ITEM Reviews retrieval tool
+
+### Item Reviews Retrieval Tool
+
 
 @traceable(
-        name="retrieve_reviews_data",
-        run_type="retriever"
+    name="retrieve_reviews_data",
+    run_type="retriever"
 )
-def retrieve_reviews_data(
-    query: str,
-    item_list: list[str],
-    k:int = 5,
-    rerank:bool = False
-    ):
+def retrieve_reviews_data(query, item_list, k=5):
 
-    qdrant_client = QdrantClient(url="http://qdrant:6333")
-    cohere_client = ClientV2() if rerank else None
+    query_embedding = get_embedding(query)
 
-    query_embedding= get_embedding(query)
-
-    fetch_limit = 20 if cohere_client else k
+    qdrant_client = QdrantClient(url="http://localhost:6333")
 
     results = qdrant_client.query_points(
         collection_name="Amazon-items-collection-02-reviews",
@@ -192,58 +149,40 @@ def retrieve_reviews_data(
             )
         ],
         query=FusionQuery(fusion="rrf"),
-        limit=fetch_limit
+        limit=k
     )
 
-    retrieval_outputs = []
+    retrieved_context_ids = []
+    retrieved_context = []
+    similarity_scores = []
 
     for result in results.points:
-        retrieval_output = RetrievalOutput(
-            context_id=result.payload["parent_asin"],
-            context=result.payload["text"],
-            similarity_score=result.score
-        )
-        retrieval_outputs.append(retrieval_output)
+        retrieved_context_ids.append(result.payload["parent_asin"])
+        retrieved_context.append(result.payload["text"])
+        similarity_scores.append(result.score)
 
-    if cohere_client:
-        context_list =[c.context for c in retrieval_outputs]
+    return {
+        "retrieved_context_ids": retrieved_context_ids,
+        "retrieved_context": retrieved_context,
+        "similarity_scores": similarity_scores,
+    }
 
-        rerank_response = cohere_client.rerank(
-            model="rerank-v4.0-fast",
-            query=query,
-            documents=context_list,
-            top_n=k
-        )
-
-        reranked_outputs =[]
-
-        for r in rerank_response.results:
-            original = retrieval_outputs[r.index]
-            reranked_output = RetrievalOutput(
-                context_id=original.context_id,
-                context=original.context,
-                similarity_score=r.relevance_score
-            )
-            reranked_outputs.append(reranked_output)
-
-        return reranked_outputs
-
-    return retrieval_outputs
 
 @traceable(
-        name="format_retrieved_reviews_context",
-        run_type="prompt"
+    name="format_retrieved_reviews_context",
+    run_type="prompt"
 )
-def process_reviews_context(context: List[RetrievalOutput]) ->str:
+def process_reviews_context(context):
 
     formatted_context = ""
 
-    for i in context: 
-        formatted_context += f"- ID: {i.context_id}, description: {i.context}\n"
+    for id, chunk in zip(context["retrieved_context_ids"], context["retrieved_context"]):
+        formatted_context += f"- ID: {id}, review: {chunk}\n"
 
     return formatted_context
 
-def get_formatted_reviews_context(query: str, item_list: list[str], top_k: int = 15, rerank: bool = False) -> str:
+
+def get_formatted_reviews_context(query: str, item_list: list, top_k: int = 15) -> str:
 
     """Get the top k reviews matching a query for a list of prefiltered items.
     
@@ -256,15 +195,18 @@ def get_formatted_reviews_context(query: str, item_list: list[str], top_k: int =
         A string of the top k context chunks with IDs prepending each chunk, each representing a review for a given inventory item for a given query.
     """
 
-    context = retrieve_reviews_data(query=query, item_list=item_list, k=top_k, rerank=rerank)
+    context = retrieve_reviews_data(query, item_list, top_k)
     formatted_context = process_reviews_context(context)
 
     return formatted_context
 
-### Shopping Cart Agent TOOLS
 
-###  Add to shopping cart Tool
+### Add to Shopping Cart Tools
 
+@traceable(
+    name="add_to_shopping_cart",
+    run_type="tool"
+)
 def add_to_shopping_cart(items: list[dict], user_id: str, cart_id: str) -> str:
 
     """Add a list of provided items to the shopping cart.
@@ -279,8 +221,8 @@ def add_to_shopping_cart(items: list[dict], user_id: str, cart_id: str) -> str:
     """
 
     conn = psycopg2.connect(
-        host="postgres",
-        port=5432,
+        host="localhost",
+        port=5434,
         database="tools_database",
         user="langgraph_user",
         password="langgraph_password"
@@ -293,7 +235,7 @@ def add_to_shopping_cart(items: list[dict], user_id: str, cart_id: str) -> str:
             product_id = item['product_id']
             quantity = item['quantity']
 
-            qdrant_client = QdrantClient(url="http://qdrant:6333")
+            qdrant_client = QdrantClient(url="http://localhost:6333")
 
             dummy_vector = np.zeros(1536).tolist()
             payload = qdrant_client.query_points(
@@ -360,8 +302,12 @@ def add_to_shopping_cart(items: list[dict], user_id: str, cart_id: str) -> str:
                 cursor.execute(insert_query, (user_id, cart_id, product_id, price, quantity, currency, product_image_url))
             
     return f"Added {items} to the shopping cart."
-###  GET shopping cart Tool
 
+
+@traceable(
+    name="get_shopping_cart",
+    run_type="tool"
+)
 def get_shopping_cart(user_id: str, cart_id: str) -> list[dict]:
 
     """
@@ -376,8 +322,8 @@ def get_shopping_cart(user_id: str, cart_id: str) -> list[dict]:
     """
     
     conn = psycopg2.connect(
-        host="postgres",
-        port=5432,
+        host="localhost",
+        port=5434,
         database="tools_database",
         user="langgraph_user",
         password="langgraph_password"
@@ -399,8 +345,11 @@ def get_shopping_cart(user_id: str, cart_id: str) -> list[dict]:
 
         return [dict(row) for row in cursor.fetchall()]
 
-###  Delete from shopping cart Tool
 
+@traceable(
+    name="remove_from_cart",
+    run_type="tool"
+)
 def remove_from_cart(product_id: str, user_id: str, cart_id: str) -> str:
 
     """
@@ -416,8 +365,8 @@ def remove_from_cart(product_id: str, user_id: str, cart_id: str) -> str:
     """
     
     conn = psycopg2.connect(
-        host="postgres",
-        port=5432,
+        host="localhost",
+        port=5433,
         database="tools_database",
         user="langgraph_user",
         password="langgraph_password"
@@ -433,15 +382,16 @@ def remove_from_cart(product_id: str, user_id: str, cart_id: str) -> str:
         cursor.execute(query, (user_id, cart_id, product_id))
 
         return cursor.rowcount > 0
-    
+
+
 ### Warehouse Manager Agent Tools
 
-def check_warehouse_availability(items: list[WarehouseItemRequest]) -> dict:
+def check_warehouse_availability(items: list[dict]) -> dict:
 
     """Check availability of items across warehouses, including partial fulfillment options.
     
     Args:
-        items: A list of WarehouseItemRequest objects to check. Each object is a TypedDict with keys: product_id, quantity.
+        items: A list of items to check. Each item is a dictionary with keys: product_id, quantity.
         
     Returns:
         A dictionary containing:
@@ -453,8 +403,8 @@ def check_warehouse_availability(items: list[WarehouseItemRequest]) -> dict:
     """
     
     conn = psycopg2.connect(
-        host="postgres",
-        port=5432,
+        host="localhost",
+        port=5434,
         database="tools_database",
         user="langgraph_user",
         password="langgraph_password"
@@ -574,12 +524,12 @@ def check_warehouse_availability(items: list[WarehouseItemRequest]) -> dict:
         conn.close()
 
 
-def reserve_warehouse_items(reservations: list[WarehouseItemReservation]) -> dict:
+def reserve_warehouse_items(reservations: list[dict]) -> dict:
     
     """Reserve items from multiple warehouses in a single transaction.
     
     Args:
-        reservations: A list of WarehouseItemReservation objects. Each object is a TypedDict with keys:
+        reservations: A list of reservations. Each reservation is a dictionary with keys:
                      - warehouse_id: The warehouse to reserve from
                      - product_id: The product to reserve
                      - quantity: The quantity to reserve
@@ -592,8 +542,8 @@ def reserve_warehouse_items(reservations: list[WarehouseItemReservation]) -> dic
     """
     
     conn = psycopg2.connect(
-        host="postgres",
-        port=5432,
+        host="localhost",
+        port=5434,
         database="tools_database",
         user="langgraph_user",
         password="langgraph_password"

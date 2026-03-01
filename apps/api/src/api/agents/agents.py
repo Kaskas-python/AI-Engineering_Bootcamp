@@ -301,7 +301,8 @@ def track_current_run(raw_response):
         current_run.metadata["usage_metadata"] = {
             "input_tokens": raw_response.usage.prompt_tokens,
             "output_tokens": raw_response.usage.completion_tokens,
-            "total_tokens": raw_response.usage.total_tokens
+            "total_tokens": raw_response.usage.total_tokens,
+            # "cached_tokens": raw_response.usage.promt_tokens_details.cached_tokens
         }
         
     return current_run

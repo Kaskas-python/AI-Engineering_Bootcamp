@@ -1,4 +1,4 @@
-from typing import Dict, Any, Annotated, List, Callable
+from typing import Dict, Any, Annotated, List, Callable, Literal
 from pydantic import BaseModel, Field
 from operator import add
 import json
@@ -10,8 +10,11 @@ import instructor
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
 from langgraph.checkpoint.postgres import PostgresSaver
-from langchain_core.messages import ToolMessage
+from langgraph.types import Command, interrupt
+from langchain_core.messages import ToolMessage, AIMessage
+from langsmith import traceable
 
 from api.agents.agents import(
     ToolCall, RAGUsedContext, Delegation, 
@@ -41,7 +44,7 @@ class CoordinatorAgentProperties(BaseModel):
     next_agent: str = ""
 
 class State(BaseModel):
-    messages: Annotated[List[Any], add] = []
+    messages: Annotated[List[Any], add_messages] = []
     product_qa_agent: AgentProperties = Field(default_factory=AgentProperties)
     shopping_cart_agent: AgentProperties = Field(default_factory=AgentProperties)
     warehouse_manager_agent: AgentProperties = Field(default_factory=AgentProperties)
@@ -52,6 +55,43 @@ class State(BaseModel):
     cart_id: str = ""
     trace_id: str = ""
     rerank: bool = False
+
+    
+### Human in the loop node
+
+@traceable(
+    name="hitl_add_to_cart"
+)
+def hitl_add_to_cart(state) -> Command[Literal["shopping_cart_agent_tool_node", END]]:
+
+    for tool_call in state.shopping_cart_agent.tool_calls:
+        if tool_call.name == "add_to_shopping_cart":
+            items_to_add = tool_call.arguments["items"]
+            break
+
+    human_input= interrupt({"items_to_add": items_to_add})
+
+    if human_input.get("confirmed"):
+        return Command(
+            update = {},
+            goto= "shopping_cart_agent_tool_node"
+        )
+    else:
+
+        last_msg = state.messages[-1]
+        
+        sanitized = AIMessage(
+            content=last_msg.content,
+            id=last_msg.id,
+        )
+        
+        return Command(
+            update={
+                "messages": [sanitized],
+                "answer": "You have rejected the addition of given items in your cart."
+                },
+            goto= END
+        )
 
 ### Edges
 
@@ -69,15 +109,24 @@ def product_qa_agent_tool_router(state: State) -> str:
     
 def shopping_cart_agent_tool_router(state: State) -> str:
     """Decide whether to continue or end"""
+    add_to_cart_tool_call = False
+    for tool_call in state.shopping_cart_agent.tool_calls:
+        if tool_call.name == "add_to_shopping_cart":
+            add_to_cart_tool_call = True
+            break
     
     if state.shopping_cart_agent.final_answer:
         return "end"
     elif state.shopping_cart_agent.iteration > 2:
         return "end"
     elif len(state.shopping_cart_agent.tool_calls) > 0:
+        if add_to_cart_tool_call:
+            return "hitl_add_to_cart"
         return "tools"
+    
     else:
         return "end"
+    
     
 def warehouse_manager_agent_tool_router(state: State) -> str:
     """Decide whether to continue or end"""
@@ -191,6 +240,7 @@ def build_workflow(state_schema:type[BaseModel]) -> StateGraph:
 
 
     workflow.add_node("coordinator_agent_node", coordinator_agent_node)
+    workflow.add_node("hitl_add_to_cart", hitl_add_to_cart)
 
 
     workflow.add_edge(START, "coordinator_agent_node")
@@ -218,6 +268,7 @@ def build_workflow(state_schema:type[BaseModel]) -> StateGraph:
         shopping_cart_agent_tool_router,
         {
             "tools": "shopping_cart_agent_tool_node",
+            "hitl_add_to_cart": "hitl_add_to_cart",
             "end": "coordinator_agent_node"
         }
     )
@@ -238,7 +289,7 @@ def build_workflow(state_schema:type[BaseModel]) -> StateGraph:
 
 
 
-def run_agent_stream(question:str, thread_id:str, rerank:bool):
+def run_agent_stream(query:str | bool, thread_id:str, step:str, rerank:bool):
 
 
     product_qa_agent_tools = build_tools(
@@ -254,36 +305,44 @@ def run_agent_stream(question:str, thread_id:str, rerank:bool):
         check_warehouse_availability=check_warehouse_availability,
         reserve_warehouse_items= reserve_warehouse_items
     )
-    state= {
-        "messages": [{"role": "user", "content": question}],
-        "user_id": thread_id,
-        "cart_id": thread_id,
-        "product_qa_agent": {
-            "iteration": 0,
-            "final_answer": False,
-            "available_tools": product_qa_agent_tools.descriptions,
-            "tool_calls": []
-        },
-        "shopping_cart_agent": {
-            "iteration": 0,
-            "final_answer": False,
-            "available_tools": shopping_cart_agent_tools.descriptions,
-            "tool_calls": []
-        },
-        "warehouse_manager_agent": {
-            "iteration": 0,
-            "final_answer": False,
-            "available_tools": warehouse_manager_agent_tools.descriptions,
-            "tool_calls": []
-        },
-        "coordinator_agent":{
-            "iteration": 0,
-            "final_answer": False,
-            "next_agent": "",
-            "plan": []
-        },
-        "rerank": rerank
-    }
+
+    if step == "initialise":
+        state= {
+            "messages": [{"role": "user", "content": query}],
+            "user_id": thread_id,
+            "cart_id": thread_id,
+            "product_qa_agent": {
+                "iteration": 0,
+                "final_answer": False,
+                "available_tools": product_qa_agent_tools.descriptions,
+                "tool_calls": []
+            },
+            "shopping_cart_agent": {
+                "iteration": 0,
+                "final_answer": False,
+                "available_tools": shopping_cart_agent_tools.descriptions,
+                "tool_calls": []
+            },
+            "warehouse_manager_agent": {
+                "iteration": 0,
+                "final_answer": False,
+                "available_tools": warehouse_manager_agent_tools.descriptions,
+                "tool_calls": []
+            },
+            "coordinator_agent":{
+                "iteration": 0,
+                "final_answer": False,
+                "next_agent": "",
+                "plan": []
+            },
+            "rerank": rerank
+        }
+    elif step == "hitl":
+        state = Command(
+            resume={
+                "confirmed": query
+            }
+        )
 
     config ={
         "configurable": {
@@ -319,6 +378,9 @@ def _string_for_sse(message:str) -> str:
 
 def _process_graph_event(chunk):
 
+    def is_interrupted(chunk):
+        return len(chunk[1].get("payload", {}).get("interrupts", [])) > 0
+
     def _is_node_start(chunk):
         return chunk[1].get("type") == "task"
 
@@ -350,9 +412,9 @@ def _process_graph_event(chunk):
 
         match node_name:
             case "coordinator_agent_node":
-                return "Analysing the question..."
-            case "product_qa_agent":
                 return "Planning..."
+            case "product_qa_agent":
+                return "Fetching information about inventory..."
             case "shopping_cart_agent" | "warehouse_manager_agent":
                 return "Performing..."
             case "product_qa_tool_node":
@@ -364,14 +426,24 @@ def _process_graph_event(chunk):
             case "warehouse_manager_agent_tool_node":
                 tool_calls = input_state.warehouse_manager_agent.tool_calls
                 return " ".join([_tool_to_text(tc) for tc in tool_calls])
-    return False
+    elif is_interrupted(chunk):
+        value = chunk[1].get("payload", {}).get("interrupts", [])[0].get("value")
+        payload = {
+            "type":"human_interrupt",
+            "data":{
+                "data": value
+            }
+        }
+        return json.dumps(payload)
 
-def rag_agent_stream_wrapper(question:str, thread_id:str, rerank:bool):
+    return "Unknown opperation..."
+
+def rag_agent_stream_wrapper(query: str | bool, thread_id:str, step:str, rerank:bool = False):
 
     qdrant_client = QdrantClient(url="http://qdrant:6333")
 
     result = None
-    for chunk in run_agent_stream(question, thread_id, rerank):
+    for chunk in run_agent_stream(query, thread_id, step, rerank):
         if isinstance(chunk, dict):
             result = chunk
         else:

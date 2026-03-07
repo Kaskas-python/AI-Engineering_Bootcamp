@@ -3,7 +3,7 @@ from fastapi.responses import StreamingResponse
 
 from api.api.models import (
     RAGRequest, RAGResponse, RAGUsedContext,
-    FeedbackRequest, FeedbackResponse
+    FeedbackRequest, FeedbackResponse, HitlRequest
 )
 from api.api.processors.submit_feedback import submit_feedback
 from api.agents.graph import rag_agent_stream_wrapper
@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 agent_router = APIRouter()
+human_response_router = APIRouter()
 feedback_router = APIRouter()
 
 
@@ -29,9 +30,25 @@ def chat(
 
     return StreamingResponse( 
         rag_agent_stream_wrapper(
-            question=payload.query,
+            query=payload.query,
             thread_id=payload.thread_id,
+            step= "initialise",
             rerank=payload.rerank
+        ),
+        media_type="text/event-stream"
+    )
+
+@human_response_router.post("/")
+def hitl(
+    request: Request,
+    payload: HitlRequest
+) -> StreamingResponse:
+
+    return StreamingResponse( 
+        rag_agent_stream_wrapper(
+            query=payload.approved,
+            thread_id=payload.thread_id,
+            step= "hitl"
         ),
         media_type="text/event-stream"
     )
@@ -52,4 +69,5 @@ def send_feedback(
 api_router = APIRouter()
 
 api_router.include_router(agent_router, prefix="/agent", tags=["agents"])
+api_router.include_router(human_response_router, prefix="/send_human_response", tags=["human"])
 api_router.include_router(feedback_router, prefix="/submit_feedback", tags=["feedback"])

@@ -27,3 +27,8 @@ class FeedbackRequest(BaseModel):
 class FeedbackResponse(BaseModel):
     request_id: str = Field(..., description="The request ID")
     status: str = Field(..., description="The status of the feedback submission")
+
+class HitlRequest(BaseModel):
+    thread_id: str = Field(..., description="Thread ID of conversation")
+    approved: bool = Field(..., description="Whether Human approved or declined action")
+    feedback: str = Field(..., description="Feedback")

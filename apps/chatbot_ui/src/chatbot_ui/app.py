@@ -103,6 +103,26 @@ def submit_feedback(feedback_type=None, feedback_text=""):
     return status, response
 
 
+@st.dialog("🔔 Human Review Required")
+def hitl_popup(task_data: dict):
+    """Modal popup that blocks the graph until human responds."""
+    st.markdown(f"**Agent wants to proceed with:**")
+    st.json(task_data)
+    
+    feedback = st.text_area("Your feedback (optional):", key="hitl_feedback")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("✅ Approve", type="primary", use_container_width=True):
+            st.session_state.pending_hitl = None
+            st.session_state.human_decision = {"approved": True, "feedback": feedback}
+            st.rerun()
+    with col2:
+        if st.button("❌ Reject", use_container_width=True):
+            st.session_state.pending_hitl = None
+            st.session_state.human_decision = {"approved": False, "feedback": feedback}
+            st.rerun()
+
 if "messages" not in st.session_state:
     st.session_state.messages = [{"role": "assistant", "content": "Hello! How can I assist you today?"}]
 
@@ -111,6 +131,9 @@ if "used_context" not in st.session_state:
 
 if "shopping_cart" not in st.session_state:
     st.session_state.shopping_cart = []
+
+if "pending_hitl" not in st.session_state:
+    st.session_state.pending_hitl = None
 
 if "latest_feedback" not in st.session_state:
     st.session_state.latest_feedback = None
@@ -123,6 +146,59 @@ if "feedback_submission_status" not in st.session_state:
 
 if "trace_id" not in st.session_state:
     st.session_state.trace_id = None
+
+if st.session_state.pending_hitl:
+    hitl_popup(st.session_state.pending_hitl)
+
+if "human_decision" not in st.session_state:
+    st.session_state.human_decision = None
+
+if st.session_state.human_decision is not None:
+    decision = st.session_state.human_decision
+    st.session_state.human_decision = None
+
+    with st.chat_message("assistant"):
+        status_placeholder = st.empty()
+        message_placeholder = st.empty()
+
+        for line in api_call_stream(
+            "post",
+            f"{config.API_URL}/send_human_response",
+            json={
+                "thread_id": session_id,
+                "approved": decision["approved"],
+                "feedback": decision.get("feedback"),
+            },
+            stream=True,
+            headers={"Accept": "text/event-stream"},
+        ):
+            line_text = line.decode("utf-8")
+            if line_text.startswith("data: "):
+                data = line_text[6:]
+                try:
+                    output = json.loads(data)
+                    if output["type"] == "final_answer":
+                        answer = output["data"]["answer"]
+                        used_context = output["data"]["used_context"]
+                        trace_id = output["data"]["trace_id"]
+                        shopping_cart = output["data"]["shopping_cart"]
+
+                        st.session_state.used_context = used_context
+                        st.session_state.messages.append({"role": "assistant", "content": answer})
+                        st.session_state.trace_id = trace_id
+                        st.session_state.shopping_cart = shopping_cart
+                        st.session_state.latest_feedback = None
+                        st.session_state.show_feedback_box = False
+                        st.session_state.feedback_submission_status = None
+
+                        status_placeholder.empty()
+                        message_placeholder.markdown(answer)
+                        break
+                except json.JSONDecodeError:
+                    status_placeholder.markdown(f"*{data}*")
+
+    st.rerun()
+
 
 with st.sidebar:
     rerank = st.checkbox("Enable reranking", value=False)
@@ -280,6 +356,7 @@ if prompt := st.chat_input("Hello! How can I assist you today?"):
                     output = json.loads(data)
 
                     if output["type"] == "final_answer":
+
                         answer = output["data"]["answer"]
                         used_context = output["data"]["used_context"]
                         trace_id = output["data"]["trace_id"]
@@ -296,6 +373,9 @@ if prompt := st.chat_input("Hello! How can I assist you today?"):
                         
                         status_placeholder.empty()
                         message_placeholder.markdown(answer)
+                        break
+                    elif output["type"] == "human_interrupt":
+                        st.session_state.pending_hitl = output["data"]
                         break
                 
                 except json.JSONDecodeError:
